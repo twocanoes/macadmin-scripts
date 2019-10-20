@@ -246,7 +246,6 @@ def replicate_url(full_url,
                   attempt_resume=False):
     '''Downloads a URL and stores it in the same relative path on our
     filesystem. Returns a path to the replicated file.'''
-
     path = urlsplit(full_url)[2]
     relative_url = path.lstrip('/')
     relative_url = os.path.normpath(relative_url)
@@ -258,15 +257,18 @@ def replicate_url(full_url,
     curl_cmd = ['/usr/bin/curl', options, '--create-dirs',
                 '-o', local_file_path]
     if not ignore_cache and os.path.exists(local_file_path):
-        curl_cmd.extend(['-z', local_file_path])
         if attempt_resume:
             curl_cmd.extend(['-C', '-'])
     curl_cmd.append(full_url)
-    print("Downloading %s..." % full_url)
-    try:
-        subprocess.check_call(curl_cmd)
-    except subprocess.CalledProcessError as err:
-        raise ReplicationError(err)
+    print("Downloading %s..." % full_url, file=sys.stderr)
+    if subprocess.call(curl_cmd)!=0:
+            print('Error downloading. Could possibly be due to bad cache file. Deleting the file and trying again.',file=sys.stderr)
+            os.unlink(local_file_path)
+            try:
+                subprocess.check_call(curl_cmd)
+            except subprocess.CalledProcessError as err:
+                raise ReplicationError(err)
+
     return local_file_path
 
 
@@ -459,10 +461,6 @@ def find_installer_app(mountpoint):
 
 def main():
     '''Do the main thing here'''
-    if os.getuid() != 0:
-        sys.exit('This command requires root (to install packages), so please '
-                 'run again with sudo or as root.')
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--seedprogram', default='',
                         help='Which Seed Program catalog to use. Valid values '
@@ -486,7 +484,16 @@ def main():
                         'less available disk space and is faster.')
     parser.add_argument('--ignore-cache', action='store_true',
                         help='Ignore any previously cached files.')
+                
+    parser.add_argument('--list', action='store_true',
+                        help='Output available product IDs and OS versions available in plist format and then exit')
+    parser.add_argument('--test', action='store_true',
+                        help='Down create image or download, just test')
+
+    parser.add_argument('--productid', metavar='productid',help='Use the specified product id. Skips prompting. Useful with --available-os-only option')
+
     args = parser.parse_args()
+
 
     if args.catalogurl:
         su_catalog_url = args.catalogurl
@@ -516,30 +523,61 @@ def main():
               file=sys.stderr)
         exit(-1)
 
-    # display a menu of choices (some seed catalogs have multiple installers)
-    print('%2s %12s %10s %8s %11s  %s'
-          % ('#', 'ProductID', 'Version', 'Build', 'Post Date', 'Title'))
-    for index, product_id in enumerate(product_info):
-        print('%2s %12s %10s %8s %11s  %s' % (
-            index + 1,
-            product_id,
-            product_info[product_id]['version'],
-            product_info[product_id]['BUILD'],
-            product_info[product_id]['PostDate'].strftime('%Y-%m-%d'),
-            product_info[product_id]['title']
-        ))
-
-    answer = get_input(
-        '\nChoose a product to download (1-%s): ' % len(product_info))
-    try:
-        index = int(answer) - 1
-        if index < 0:
-            raise ValueError
-        product_id = list(product_info.keys())[index]
-    except (ValueError, IndexError):
-        print('Exiting.')
+    if args.productid:
+        product_id=args.productid    
+    else:
+        available_os={}
+        # display a menu of choices (some seed catalogs have multiple installers)
+        if args.list==False:
+            print('%2s %12s %10s %8s %11s  %s'
+                  % ('#', 'ProductID', 'Version', 'Build', 'Post Date', 'Title'))
+        for index, product_id in enumerate(product_info):
+            version=product_info[product_id]['version']
+            build=product_info[product_id]['BUILD']
+            post_date=product_info[product_id]['PostDate'].strftime('%Y-%m-%d')
+            title=product_info[product_id]['title']
+            if args.list==True:
+                available_os[product_id]={'version':version,
+                                      'build':build,
+                                  'post_date':post_date,
+                                      'title':title}
+            else:
+                print('%2s %12s %10s %8s %11s  %s' % (
+                    index + 1,
+                    product_id,
+                    version,
+                    build,
+                    post_date,
+                    title
+                ))
+    
+        if args.list==True:
+            print (plistlib.writePlistToString(available_os))
+            exit(0)
+    
+    if args.productid: 
+        if args.productid in product_info:
+            product_id=args.productid
+        else:
+            print("product id not found:" + args.productid,file=sys.stderr)
+            exit(-1)
+    else:
+        answer = get_input(
+            '\nChoose a product to download (1-%s): ' % len(product_info))
+        try:
+            index = int(answer) - 1
+            if index < 0:
+                raise ValueError
+            product_id = list(product_info.keys())[index]
+        except (ValueError, IndexError):
+            print('Exiting.',file=sys.stderr)
+            exit(0)
+    
+    if os.getuid() != 0:
+        sys.exit('This command requires root (to install packages), so please '
+                'run again with sudo or as root.')
+    if args.test==True:
         exit(0)
-
     # download all the packages for the selected product
     replicate_product(
         catalog, product_id, args.workdir, ignore_cache=args.ignore_cache)
@@ -553,7 +591,7 @@ def main():
         os.unlink(sparse_diskimage_path)
 
     # make an empty sparseimage and mount it
-    print('Making empty sparseimage...')
+    print('Making empty sparseimage...',file=sys.stderr)
     sparse_diskimage_path = make_sparse_image(volname, sparse_diskimage_path)
     mountpoint = mountdmg(sparse_diskimage_path)
     if mountpoint:
@@ -571,9 +609,9 @@ def main():
             installer_app = find_installer_app(mountpoint)
             if installer_app:
                 print("Adding seeding program %s extended attribute to app"
-                      % seeding_program)
+                      % seeding_program,file=sys.stderr)
                 xattr.setxattr(installer_app, 'SeedProgram', seeding_program)
-        print('Product downloaded and installed to %s' % sparse_diskimage_path)
+        print('Product downloaded and installed to %s' % sparse_diskimage_path,file=sys.stderr)
         if args.raw:
             unmountdmg(mountpoint)
         else:
